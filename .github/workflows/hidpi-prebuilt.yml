@@ -1,0 +1,89 @@
+name: Rebuild HiDPI guest prebuilts
+on:
+  push:
+    branches:
+      - 'steelbrain/hidpi-cursor-cloud-build'
+    paths:
+      - '.github/workflows/hidpi-prebuilt.yml'
+      - 'ci-hidpi-input/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hidpi-guest-prebuilt
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      REIMS_PR_BUILD_JOBS: '3'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: false
+          sparse-checkout: ci-hidpi-input
+      - name: Verify runner and source archive
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          sw_vers
+          test -d "$DEVELOPER_DIR"
+          xcode_version=$(xcodebuild -version)
+          printf '%s\n' "$xcode_version"
+          grep -Fxq 'Xcode 27.2' <<<"$xcode_version"
+          grep -Fxq 'Build version 27B52' <<<"$xcode_version"
+          sdk_version=$(xcrun --sdk macosx --show-sdk-version)
+          test "$sdk_version" = 27.2
+          for tool in clang clang++ ld; do xcrun --sdk macosx --find "$tool"; done
+          for tool in python3 make lipo ditto xxd codesign plutil tar shasum; do command -v "$tool"; done
+          df -h "$RUNNER_TEMP"
+          free_kib=$(df -Pk "$RUNNER_TEMP" | awk 'END {print $4}')
+          (( free_kib >= 5 * 1024 * 1024 ))
+          cd ci-hidpi-input
+          shasum -a 256 -c source.sha256
+          build_dir=$(mktemp -d "$RUNNER_TEMP/hidpi-build.XXXXXXXX")
+          tar -xzf source.tar.gz -C "$build_dir"
+          printf 'build_dir=%s\n' "$build_dir" >>"$GITHUB_OUTPUT"
+      - name: Build and run available guest tests
+        shell: bash
+        env:
+          BUILD_DIR: ${{ steps.prepare.outputs.build_dir }}
+        run: /bin/bash "$BUILD_DIR/build-macos.sh"
+      - name: Upload checked build results and logs
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hidpi-guest-build
+          retention-days: 5
+          if-no-files-found: warn
+          path: |
+            ${{ steps.prepare.outputs.build_dir }}/results.tar.gz
+            ${{ steps.prepare.outputs.build_dir }}/results.sha256
+            ${{ steps.prepare.outputs.build_dir }}/status.tsv
+            ${{ steps.prepare.outputs.build_dir }}/logs/*.log
+      - name: Require both checked prebuilt sets
+        shell: bash
+        env:
+          BUILD_DIR: ${{ steps.prepare.outputs.build_dir }}
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+          shasum -a 256 -c results.sha256
+          for step in prebuilt-x86 prebuilt-arm64e prebuilt-check check-x86 check-arm64e; do
+            awk -F '\t' -v name="$step" '$1 == name && $2 == "PASS" { ok=1 } END { exit !ok }' status.tsv
+          done
+          awk -F '\t' '
+            $2 == "FAIL" && $1 ~ /^(guest-test$|kext-test$|rgfxgate-test$|kext-build-|kext-run-|bundle-build-|bundle-run-)/ {
+              print "Failed test or test build: " $1
+              failed=1
+            }
+            END { exit failed }
+          ' status.tsv
